@@ -1,0 +1,9 @@
+# Top-level dependencies. constraints.txt is the full lock of a verified build.
+torch
+torchaudio
+pyannote.audio==4.0.7
+faster-whisper
+fastapi
+uvicorn
+python-multipart
+numpy
