@@ -57,7 +57,7 @@ full signatures): at 5 s the same-person minimum is 0.35 and 18% fall under
 
 Coppermind will send the attendee count. With the correct count (A1 and A2,
 `num_speakers=9`) pyannote's own count already matched, the centroids were
-identical (cosine 1.000) and nothing changed. FORCED_OVERCOUNT
+identical (cosine 1.000) and nothing changed. With an over-count (D, 12 people, `num_speakers=14`) the 12 real speakers' centroids were unchanged (cosine 0.998 to 1.000 against the unforced run), and pyannote added two spurious labels from fragments with 5 s and 3 s of clean speech (one of them only 42% one person). Both are under the 20 s floor, so the service returns no signature for them; the 3 s fragment scored 0.595 against the real person elsewhere, which is exactly the case the floor exists for. The extra labels still appear in `segments` as extra "Speaker N" with a few words each.
 
 ## Recommendation
 
