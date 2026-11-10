@@ -59,3 +59,33 @@ def test_interrupted_sentence_ends_at_the_dash():
     segs = assign_speakers(words, turns)
     assert [(s["speaker"], s["text"]) for s in segs] == [
         ("Speaker 1", "I will go through—"), ("Speaker 2", "Well, but no.")]
+
+
+def test_unpunctuated_speaker_change_is_split():
+    a = "so what do you think about the plan for next week".split()
+    b = "I think we should ship it on Monday and see.".split()
+    words = [(i * 0.3, i * 0.3 + 0.25, " " + w) for i, w in enumerate(a)]
+    words += [(3.3 + i * 0.3, 3.3 + i * 0.3 + 0.25, " " + w) for i, w in enumerate(b)]  # 0.35 s gap
+    turns = [(0.0, 3.1, "A"), (3.2, 8.0, "B")]
+    segs = assign_speakers(words, turns)
+    assert [(s["speaker"], s["text"]) for s in segs] == [
+        ("Speaker 1", " ".join(a)), ("Speaker 2", " ".join(b))]
+
+
+def test_overlapping_turns_scan_far_enough_back():
+    turns = [(0.0, 500.0, "A"), (10.0, 20.0, "B")]
+    starts = [t[0] for t in turns]
+    assert speaker_at(100.0, 101.0, turns, starts) == "A"
+
+
+def test_windows_cover_audio_and_cut_in_silence():
+    import numpy as np
+    from app.assign import windows
+    rate = 100
+    audio = np.ones(rate * 250, dtype="float32")
+    audio[rate * 85:rate * 86] = 0.0  # one quiet second inside the search span before 100 s
+    w = windows(audio, rate, 100.0, search=30.0)
+    assert w[0][0] == 0.0 and w[-1][1] == 250.0
+    assert all(a[1] == b[0] for a, b in zip(w, w[1:]))
+    assert 85.0 <= w[0][1] < 86.0
+    assert all(e - s <= 100.0 for s, e in w)

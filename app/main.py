@@ -46,7 +46,7 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from app.assign import assign_speakers, cpu_limit
+from app.assign import assign_speakers, cpu_limit, windows
 
 log = logging.getLogger("transcribe")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -61,8 +61,9 @@ BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", 5))
 # about 2.6 times what 0.25 does on a CPU (measured; 0.5 fragments turns).
 DIARIZATION_STEP = float(os.environ.get("DIARIZATION_STEP", 0.25))
 THREADS = int(os.environ.get("THREADS") or cpu_limit())
+WHISPER_WINDOW = float(os.environ.get("WHISPER_WINDOW", 1200))
 SAMPLE_RATE = 16000
-MAX_SECONDS = float(os.environ.get("MAX_SECONDS", 2 * 3600))
+MAX_SECONDS = float(os.environ.get("MAX_SECONDS", 2.5 * 3600))
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 1024**3))
 MAX_JOBS = int(os.environ.get("MAX_JOBS", 1))
 JOB_TTL = float(os.environ.get("JOB_TTL", 24 * 3600))
@@ -123,24 +124,57 @@ async def startup():
     app.state.reaper = asyncio.create_task(reap_jobs())
 
 
-@app.middleware("http")
-async def auth_and_size(request: Request, call_next):
-    """Reject a bad key or an oversized upload before the body is read."""
-    if request.url.path != "/health":
-        token = request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+class Gate:
+    """Plain ASGI middleware: refuse before a byte of the body is read.
+
+    Not @app.middleware("http"): that wrapper hides the client's disconnect
+    from request.is_disconnected(), and a cancelled request would then hold
+    every CPU until its job ended. Checked here, in order: the key (401); for
+    an upload, a Content-Length (411: without one the size is unknown until
+    the body has been spooled to disk) within MAX_UPLOAD_BYTES (413), models
+    loaded (503), a free job slot (429).
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope["path"] == "/health":
+            return await self.app(scope, receive, send)
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+        token = headers.get("authorization", "").removeprefix("Bearer ").strip()
+        status, message = 0, ""
         if not hmac.compare_digest(token.encode(), API_KEY.encode()):
-            return JSONResponse({"error": {"message": "invalid api key"}}, status_code=401)
-        length = request.headers.get("content-length")
-        if length and length.isdigit() and int(length) > MAX_UPLOAD_BYTES:
-            return JSONResponse({"error": {"message": "upload too large"}}, status_code=413)
-    return await call_next(request)
+            status, message = 401, "invalid api key"
+        elif scope["method"] == "POST" and scope["path"].startswith("/v1/audio/transcriptions"):
+            length = headers.get("content-length", "")
+            if not length.isdigit():
+                status, message = 411, "Content-Length required"
+            elif int(length) > MAX_UPLOAD_BYTES:
+                status, message = 413, "upload too large"
+            elif model_error:
+                status, message = 503, model_error
+            elif jobs.locked():
+                status, message = 429, f"{MAX_JOBS} transcriptions already running, retry later"
+        if status:
+            return await JSONResponse({"error": {"message": message}}, status_code=status)(scope, receive, send)
+        return await self.app(scope, receive, send)
 
 
-def decode(path: str) -> np.ndarray:
-    """Any audio ffmpeg reads -> 16 kHz mono float32, at most MAX_SECONDS."""
+app.add_middleware(Gate)
+
+
+def decode(fd: int) -> np.ndarray:
+    """Any audio ffmpeg reads -> 16 kHz mono float32, at most MAX_SECONDS.
+
+    fd is the upload Starlette already spooled to disk. ffprobe and ffmpeg open
+    it as /dev/fd/N (a fresh, seekable open of the same file), so the upload is
+    never copied a second time.
+    """
+    path = f"/dev/fd/{fd}"
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=format_name", "-of", "json", path],
-        capture_output=True, check=False)
+        capture_output=True, check=False, pass_fds=(fd,))
     try:
         names = set(json.loads(probe.stdout)["format"]["format_name"].split(","))
     except (ValueError, KeyError):
@@ -153,7 +187,7 @@ def decode(path: str) -> np.ndarray:
         proc = subprocess.run(
             ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", path, "-t", str(MAX_SECONDS + 1),
              "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", raw.name],
-            capture_output=True, check=False)
+            capture_output=True, check=False, pass_fds=(fd,))
         if proc.returncode != 0:
             raise HTTPException(status_code=400, detail="could not decode audio: "
                                 + proc.stderr.decode(errors="replace")[-300:])
@@ -183,20 +217,31 @@ def diarize(audio: np.ndarray, cancel: threading.Event, **speakers) -> list[tupl
 
 
 def transcribe_words(audio: np.ndarray, cancel: threading.Event, language, prompt):
-    """-> ([(start, end, word)], detected language)."""
-    segments, info = models["whisper"].transcribe(
-        audio, language=language or None, initial_prompt=prompt or None, beam_size=BEAM_SIZE,
-        word_timestamps=True, vad_filter=True,
-        # Off: on hour-long audio, conditioning on the previous window is what
-        # lets one hallucinated line repeat for minutes.
-        condition_on_previous_text=False)
-    words = []
-    for seg in segments:  # a generator: the work happens here, window by window
-        if cancel.is_set():
-            raise Cancelled()
-        for w in seg.words or []:
-            words.append((w.start, w.end, w.word))
-    return words, info.language
+    """-> ([(start, end, word)], detected language).
+
+    Whisper gets the recording in windows of WHISPER_WINDOW seconds cut at the
+    quietest point near each boundary: faster-whisper computes the log-mel
+    features for everything it is given at once (about 3 GB per hour of audio),
+    so whole-file input would make memory grow with the recording.
+    """
+    words, detected = [], language
+    for start, end in windows(audio, SAMPLE_RATE, WHISPER_WINDOW):
+        segments, info = models["whisper"].transcribe(
+            audio[int(start * SAMPLE_RATE):int(end * SAMPLE_RATE)],
+            language=detected or None, initial_prompt=prompt or None, beam_size=BEAM_SIZE,
+            word_timestamps=True, vad_filter=True,
+            # Off: on hour-long audio, conditioning on the previous window is what
+            # lets one hallucinated line repeat for minutes.
+            condition_on_previous_text=False)
+        for seg in segments:  # a generator: the work happens here, 30 s at a time
+            if cancel.is_set():
+                raise Cancelled()
+            for w in seg.words or []:
+                words.append((start + w.start, start + w.end, w.word))
+        # Detected once, from the first window, then held: a later window of
+        # silence or crosstalk must not switch the language mid-meeting.
+        detected = detected or info.language
+    return words, detected
 
 
 def run_job(audio: np.ndarray, cancel: threading.Event, language, prompt, speakers) -> dict:
@@ -232,6 +277,7 @@ def render(result: dict, response_format: str):
 
 
 def check_request(response_format):
+    """Re-checked here because Gate's checks and the job slot are not atomic."""
     if response_format not in FORMATS:
         raise HTTPException(status_code=400, detail=f"unsupported response_format {response_format!r}")
     if model_error:
@@ -241,15 +287,17 @@ def check_request(response_format):
 
 
 async def receive(file: UploadFile) -> np.ndarray:
-    with tempfile.NamedTemporaryFile() as tmp:
-        size = 0
-        while block := await file.read(1 << 20):
-            size += len(block)
-            if size > MAX_UPLOAD_BYTES:
-                raise HTTPException(status_code=413, detail="upload too large")
-            tmp.write(block)
-        tmp.flush()
-        return await asyncio.to_thread(decode, tmp.name)
+    """Decode the spooled upload, then delete the spool (it would sit on disk for the whole job)."""
+    try:
+        spool = file.file
+        if hasattr(spool, "rollover"):
+            spool.rollover()  # a small upload may still be in memory; give it a file
+        spool.flush()
+        if os.fstat(spool.fileno()).st_size > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="upload too large")
+        return await asyncio.to_thread(decode, spool.fileno())
+    finally:
+        await file.close()
 
 
 def speaker_args(num_speakers, min_speakers, max_speakers):

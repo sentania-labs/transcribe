@@ -48,10 +48,11 @@ finish and lost on restart.
 
 | var | default | |
 |---|---|---|
-| `TRANSCRIBE_API_KEY` | required | bearer key, checked before the upload is read |
+| `TRANSCRIBE_API_KEY` | required | bearer key, checked before the upload is read; uploads need a Content-Length (411 otherwise) |
 | `MAX_UPLOAD_BYTES` | 1 GiB | larger uploads get 413 |
-| `MAX_SECONDS` | 7200 | longer audio gets 413 |
-| `MAX_JOBS` | 1 | more at once get 429 |
+| `MAX_SECONDS` | 9000 | longer audio gets 413 |
+| `MAX_JOBS` | 1 | more at once get 429, before the upload is read |
+| `WHISPER_WINDOW` | 1200 | seconds of audio per Whisper pass, cut at silence; bounds feature memory (about 3 GB per hour of input otherwise) |
 | `DIARIZATION_STEP` | 0.25 | pyannote sliding-window step as a fraction of its 10 s window (pyannote default 0.1: 2.6x slower, same turns on the test clip; 0.5 fragments turns) |
 | `WHISPER_BEAM_SIZE` | 5 | 1 is greedy and faster |
 | `WHISPER_COMPUTE_TYPE` | int8 | CTranslate2 compute type |

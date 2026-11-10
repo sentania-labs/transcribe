@@ -6,6 +6,8 @@ PAUSE_SPLIT = 5.0    # a pause this long starts a new segment, even for one spea
 MAX_SEGMENT = 60.0   # never let one segment grow past this (seconds)
 SENTENCE_GAP = 1.0   # a pause this long also ends a sentence
 SENTENCE_MAX = 40    # words; a sentence with no punctuation is cut here
+MIN_RUN = 8          # words; a shorter run of another speaker inside a sentence is timing noise
+                     # (4 split real sentences on the test recording: diarization edges drift ~1 s)
 SENTENCE_END = (".", "?", "!", "—", "…")  # dash: an interrupted sentence
 
 
@@ -20,7 +22,23 @@ def cpu_limit() -> int:
     return len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
 
 
-def overlaps(start: float, end: float, turns, starts) -> dict:
+def windows(audio, rate: int, size: float, search: float = 30.0):
+    """[(start, end)] seconds covering audio in pieces of at most `size`, each cut
+    at the quietest 100 ms in the last `search` seconds before the limit."""
+    total = len(audio) / rate
+    start, out = 0.0, []
+    frame = rate // 10
+    while total - start > size:
+        lo, hi = int((start + size - search) * rate), int((start + size) * rate)
+        chunk = audio[lo:hi][: (hi - lo) // frame * frame].reshape(-1, frame)
+        cut = (lo + int(((chunk.astype("float64") ** 2).mean(axis=1)).argmin()) * frame) / rate
+        out.append((start, cut))
+        start = cut
+    out.append((start, total))
+    return out
+
+
+def overlaps(start: float, end: float, turns, starts, longest: float = 0.0) -> dict:
     """{speaker: seconds of [start, end] inside that speaker's turns}.
 
     With no overlap at all, the nearest turn's speaker gets a token weight, so
@@ -30,10 +48,11 @@ def overlaps(start: float, end: float, turns, starts) -> dict:
         return {}
     i = bisect.bisect_right(starts, end)
     out = {}
-    # Turns are sorted and non-overlapping (exclusive diarization), so only the
-    # turns starting before `end` and ending after `start` can overlap.
+    # Turns are sorted by start; one that overlaps [start, end] starts before
+    # `end` and no earlier than `start - longest` (the longest turn's length).
+    longest = longest or max(e - s for s, e, _ in turns)
     j = i - 1
-    while j >= 0 and turns[j][1] > start - 30:
+    while j >= 0 and turns[j][0] >= start - longest:
         s, e, spk = turns[j]
         ov = min(e, end) - max(s, start)
         if ov > 0:
@@ -47,8 +66,8 @@ def overlaps(start: float, end: float, turns, starts) -> dict:
     return {spk: 1e-6}
 
 
-def speaker_at(start: float, end: float, turns, starts) -> str | None:
-    ov = overlaps(start, end, turns, starts)
+def speaker_at(start: float, end: float, turns, starts, longest: float = 0.0) -> str | None:
+    ov = overlaps(start, end, turns, starts, longest)
     return max(ov, key=ov.get) if ov else None
 
 
@@ -67,6 +86,39 @@ def sentences(words):
         yield cur
 
 
+def split_runs(sent, turns, starts, longest):
+    """A sentence -> pieces, split where the word-level speaker changes for at
+    least MIN_RUN words. Whisper sometimes leaves a speaker change unpunctuated;
+    shorter runs are timing noise at a turn edge and stay with their neighbours."""
+    runs = []
+    for w in sent:
+        spk = speaker_at(w[0], w[1], turns, starts, longest)
+        if runs and runs[-1][0] == spk:
+            runs[-1][1].append(w)
+        else:
+            runs.append([spk, [w]])
+    while len(runs) > 1:
+        short = [k for k, r in enumerate(runs) if len(r[1]) < MIN_RUN]
+        if not short:
+            break
+        k = short[0]
+        # Fold into the longer neighbour, then join neighbours left equal.
+        n = k - 1 if k == len(runs) - 1 or (k > 0 and len(runs[k - 1][1]) >= len(runs[k + 1][1])) else k + 1
+        if n < k:
+            runs[n][1].extend(runs[k][1])
+        else:
+            runs[n][1][:0] = runs[k][1]
+        del runs[k]
+        merged = [runs[0]]
+        for r in runs[1:]:
+            if r[0] == merged[-1][0]:
+                merged[-1][1].extend(r[1])
+            else:
+                merged.append(r)
+        runs = merged
+    return [r[1] for r in runs]
+
+
 def assign_speakers(words, turns):
     """words [(start, end, text)], turns [(start, end, speaker)] -> segments.
 
@@ -79,11 +131,13 @@ def assign_speakers(words, turns):
     """
     turns = sorted(turns)
     starts = [t[0] for t in turns]
+    longest = max((e - s for s, e, _ in turns), default=0.0)
+    pieces = [p for sent in sentences(words) for p in split_runs(sent, turns, starts, longest)]
     names, segments, cur = {}, [], None
-    for sent in sentences(words):
+    for sent in pieces:
         votes = {}
         for start, end, _ in sent:
-            for spk, ov in overlaps(start, end, turns, starts).items():
+            for spk, ov in overlaps(start, end, turns, starts, longest).items():
                 votes[spk] = votes.get(spk, 0.0) + ov
         spk = max(votes, key=votes.get) if votes else "unknown"
         start, end = sent[0][0], sent[-1][1]
