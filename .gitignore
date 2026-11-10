@@ -1,0 +1,6 @@
+models/
+*.wav
+*.mp3
+*.m4a
+__pycache__/
+.pytest_cache/
