@@ -28,6 +28,9 @@ def windows(audio, rate: int, size: float, search: float = 30.0):
     total = len(audio) / rate
     start, out = 0.0, []
     frame = rate // 10
+    # At most half the window, so a cut always lands in the window's second half
+    # and every window advances, whatever `size` is set to.
+    search = max(frame / rate, min(search, size / 2))
     while total - start > size:
         lo, hi = int((start + size - search) * rate), int((start + size) * rate)
         chunk = audio[lo:hi][: (hi - lo) // frame * frame].reshape(-1, frame)

@@ -89,3 +89,13 @@ def test_windows_cover_audio_and_cut_in_silence():
     assert all(a[1] == b[0] for a, b in zip(w, w[1:]))
     assert 85.0 <= w[0][1] < 86.0
     assert all(e - s <= 100.0 for s, e in w)
+
+
+def test_short_windows_always_advance():
+    import numpy as np
+    from app.assign import windows
+    rate = 100
+    for size in (0.5, 5.0, 30.0):
+        w = windows(np.zeros(rate * 120, dtype="float32"), rate, size)  # all silence
+        assert w[-1][1] == 120.0
+        assert all(e > s for s, e in w) and all(e - s <= size for s, e in w)
