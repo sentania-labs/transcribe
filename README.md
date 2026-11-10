@@ -10,8 +10,9 @@ Kubernetes cluster; speed is not the point, no GPU is needed.
   20-minute windows cut at silence.
 - **Join**: each sentence goes to the speaker who covers most of its words' time; a run of 8+
   words from another speaker inside an unpunctuated sentence splits it (`app/assign.py`).
-- **Voice signatures** (opt in): one unit-length vector per speaker and voice model, from
-  that speaker's clean speech (`app/voice.py`). The service never stores or matches them.
+- **Voice signatures** (opt in): one unit-length vector per speaker and voice model; by
+  default the diarization pipeline's own speaker centroid (`app/voice.py`). The service
+  never stores or matches them.
 
 Threads follow the container's CPU limit (cgroup `cpu.max`), or `THREADS`. About 0.41 x
 the audio length on 4 CPUs (a 76 min recording took 31.5 min); signatures add a little.
@@ -64,7 +65,7 @@ start, end, text}`):
   "speakers": [
     {"label": "Speaker 1", "speech_seconds": 300.0, "segment_count": 14,
      "embeddings": [{"model": "pyannote/speaker-diarization-community-1/embedding",
-                     "version": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee+clean-mean-v1",
+                     "version": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee+pipeline-centroid-v1",
                      "vector": [0.0123, -0.0456, "... 256 numbers"]}]}
   ]
 }
@@ -74,9 +75,10 @@ start, end, text}`):
 `segment_count` counts that label's segments. `embeddings` holds one entry per configured
 voice model, each a unit-length vector (compare with plain cosine, only within one
 `model` + `version`). A speaker with less than `VOICE_MIN_SECONDS` of clean speech (time
-when they and nobody else talk) gets no entry: `embeddings` may be empty. With an
-embedding, `speech_seconds` is the clean speech it was built from (at most 300 s, spread
-over the recording); without one, the clean speech that was available.
+when they and nobody else talk) gets no entry: `embeddings` may be empty.
+`speech_seconds` is the speaker's clean speech in the recording (alone, no overlap): what
+the signature is built from, and what the `VOICE_MIN_SECONDS` floor (default 20) is
+checked against.
 
 The text is `Speaker N: ...` lines; `text` format returns only that.
 
@@ -137,7 +139,7 @@ signatures (`embeddings` is always empty). Each entry:
 ```json
 {"model": "pyannote/speaker-diarization-community-1/embedding",
  "revision": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee",
- "method": "clean-mean-v1",
+ "method": "pipeline-centroid-v1",
  "path": "/models/pyannote/speaker-diarization-community-1/embedding",
  "sha256": "6f10ff60898a1d185fa22e1d11e0bfa8a92efec811f11bca48cb8cafebefd929"}
 ```
@@ -152,9 +154,18 @@ both run and each speaker gets two vectors; removing the old entry ends it. Chan
 identical as long as it supports the configured `method` (an image that drops a method
 refuses to start with that config rather than guess).
 
-`clean-mean-v1`: the speaker's clean regions cut into 2-10 s windows, at most 300 s spread
-evenly over the recording, each window embedded, unit-normalised, duration-weighted mean,
-unit-normalised again.
+Methods:
+
+- `pipeline-centroid-v1` (deployed): the diarization pipeline's own per-speaker centroid,
+  i.e. pyannote community-1's VBx-weighted mean of its 10 s chunk embeddings with
+  overlapped speech excluded (a plain mean per cluster when a speaker count is forced),
+  unit-normalised. Costs nothing extra. Only valid for the pipeline's own embedding model:
+  the entry's `path` must be the pipeline's `embedding/` directory, or the service refuses.
+- `clean-mean-v1`: the speaker's clean regions cut into 2-10 s windows, at most 300 s
+  spread over the recording, each embedded, duration-weighted mean, unit-normalised. Works
+  with any pyannote embedding model, so it is how a second model can run during a
+  changeover. Measured clearly weaker on the same model (different people up to 0.78
+  cosine against 0.45 for the centroid; `docs/voice-eval.md`).
 
 ## Privacy
 
@@ -175,7 +186,7 @@ answer except a job's result until it is purged.
 | `MAX_JOBS` | 1 | more at once: `busy`, before the upload is read |
 | `JOB_TTL` | 7200 | seconds a finished job's result is kept |
 | `VOICE_MODELS` | empty | voice models, above |
-| `VOICE_MIN_SECONDS` | 30 | clean speech needed for a signature |
+| `VOICE_MIN_SECONDS` | 20 | clean speech needed for a signature |
 | `WHISPER_MODEL_ID`, `WHISPER_MODEL_REVISION`, `WHISPER_MODEL_SHA256` | `large-v3-turbo`, empty, empty | reported in status; a set sha256 is verified at start |
 | `DIARIZATION_MODEL_ID`, `DIARIZATION_MODEL_REVISION` | community-1, empty | reported in status |
 | `WHISPER_WINDOW` | 1200 | seconds of audio per Whisper pass, cut at silence; bounds feature memory |

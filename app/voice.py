@@ -31,7 +31,15 @@ WINDOW_MIN = 2.0
 # At most this much clean speech per speaker goes into a signature, spread
 # evenly over the recording: bounds the CPU cost for a two-hour monologue.
 SPEAKER_BUDGET = 300.0
-METHODS = ("clean-mean-v1",)
+# pipeline-centroid-v1: the diarization pipeline's own per-speaker centroid
+#   (pyannote community-1: VBx-weighted mean of its 10 s chunk embeddings,
+#   overlap excluded). Only for the embedding model the pipeline itself uses.
+#   Measured best (docs/voice-eval.md): same person across recordings >= 0.795,
+#   different people <= 0.447.
+# clean-mean-v1: this service's own windows over clean speech, embedded with
+#   any configured model. Measured weaker (different people up to 0.781); kept
+#   because it is the only way to run a SECOND model during a changeover.
+METHODS = ("pipeline-centroid-v1", "clean-mean-v1")
 
 
 class VoiceConfigError(ValueError):
@@ -148,18 +156,28 @@ def mean_signature(vectors, weights):
 
 
 class VoiceModel:
-    """A loaded voice model entry: embeds windows of 16 kHz mono float32 audio."""
+    """A loaded voice model entry: embeds windows of 16 kHz mono float32 audio.
 
-    def __init__(self, entry: dict, threads: int):
-        import torch
-        from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
+    pipeline_embedding: the directory of the embedding model the diarization
+    pipeline uses; a pipeline-centroid-v1 entry must point at exactly it.
+    """
+
+    def __init__(self, entry: dict, threads: int, pipeline_embedding: str | None = None):
         weights = os.path.join(entry["path"], "pytorch_model.bin")
         digest = file_sha256(weights)
         if digest != entry["sha256"]:
             raise VoiceConfigError(f"{entry['model']}: pytorch_model.bin sha256 {digest[:12]} "
                                    f"does not match the configured {entry['sha256'][:12]}")
-        torch.set_num_threads(threads)
         self.entry = entry
+        self.embedding = None
+        if entry["method"] == "pipeline-centroid-v1":
+            if not pipeline_embedding or os.path.realpath(entry["path"]) != os.path.realpath(pipeline_embedding):
+                raise VoiceConfigError(f"{entry['model']}: pipeline-centroid-v1 needs the path of the "
+                                       f"diarization pipeline's own embedding model ({pipeline_embedding})")
+            return
+        import torch
+        from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
+        torch.set_num_threads(threads)
         self.embedding = PretrainedSpeakerEmbedding(entry["path"], device=torch.device("cpu"))
 
     def embed(self, audio, windows, rate: int, batch: int = 16):

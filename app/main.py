@@ -39,7 +39,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.assign import assign_speakers, cpu_limit, windows
-from app.voice import VoiceConfigError, VoiceModel, clean_regions, file_sha256, parse_voice_models
+from app.voice import VoiceConfigError, VoiceModel, clean_regions, file_sha256, parse_voice_models, unit
 
 log = logging.getLogger("transcribe")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -64,7 +64,8 @@ DIARIZATION_STEP = float(os.environ.get("DIARIZATION_STEP", 0.25))
 THREADS = int(os.environ.get("THREADS") or cpu_limit())
 WHISPER_WINDOW = float(os.environ.get("WHISPER_WINDOW", 1200))
 VOICE_MODELS_RAW = os.environ.get("VOICE_MODELS", "")
-VOICE_MIN_SECONDS = float(os.environ.get("VOICE_MIN_SECONDS", 30))
+# Clean speech a speaker needs before a signature is returned (docs/voice-eval.md).
+VOICE_MIN_SECONDS = float(os.environ.get("VOICE_MIN_SECONDS", 20))
 SAMPLE_RATE = 16000
 # Job path limit, and the direct path's (a synchronous call has to finish
 # inside the ingress's 3600 s; at ~0.41 x audio length that is about 2h20m).
@@ -179,7 +180,7 @@ def load_models():
             pipeline._segmentation.step = DIARIZATION_STEP * pipeline._segmentation.duration
             whisper = WhisperModel(WHISPER_PATH, device="cpu", compute_type=COMPUTE_TYPE,
                                    cpu_threads=THREADS, num_workers=1)
-            voices = [VoiceModel(e, THREADS) for e in voice_entries]
+            voices = [VoiceModel(e, THREADS, os.path.join(PIPELINE_PATH, "embedding")) for e in voice_entries]
         except VoiceConfigError as e:  # wrong files on the volume: do not retry into a loop
             model_error = str(e)
             log.error("%s", model_error)
@@ -299,7 +300,8 @@ def decode(fd: int, limit: float, path_name: str) -> np.ndarray:
 
 
 def diarize(audio: np.ndarray, cancel: threading.Event, **speakers):
-    """-> (exclusive turns for words, overlap-aware turns for clean speech)."""
+    """-> (exclusive turns for words, overlap-aware turns for clean speech,
+    {label: pipeline centroid})."""
     import torch
 
     def hook(*args, **kwargs):  # pyannote calls this between and within steps
@@ -312,8 +314,13 @@ def diarize(audio: np.ndarray, cancel: threading.Event, **speakers):
     # most one speaker, which is what assigning each word to one speaker needs.
     full = getattr(out, "speaker_diarization", out)
     exclusive = getattr(out, "exclusive_speaker_diarization", None) or full
+    # speaker_embeddings rows follow full.labels(); zero rows (speakers the
+    # clustering never saw) are dropped by unit() later.
+    emb = getattr(out, "speaker_embeddings", None)
+    centroids = {} if emb is None else {lab: [float(x) for x in emb[i]] for i, lab in enumerate(full.labels())}
     return ([(t.start, t.end, s) for t, _, s in exclusive.itertracks(yield_label=True)],
-            [(t.start, t.end, s) for t, _, s in full.itertracks(yield_label=True)])
+            [(t.start, t.end, s) for t, _, s in full.itertracks(yield_label=True)],
+            centroids)
 
 
 def transcribe_words(audio: np.ndarray, cancel: threading.Event, language, prompt):
@@ -344,8 +351,12 @@ def transcribe_words(audio: np.ndarray, cancel: threading.Event, language, promp
     return words, detected
 
 
-def signatures(audio, full_turns, names, segments, cancel) -> list[dict]:
-    """One `speakers` entry per label used in `segments`, in label order."""
+def signatures(audio, full_turns, centroids, names, segments, cancel) -> list[dict]:
+    """One `speakers` entry per label used in `segments`, in label order.
+
+    speech_seconds is the speaker's clean speech (alone, no overlap): what a
+    pipeline-centroid vector is built from, and the cap (300 s) for clean-mean.
+    """
     clean = clean_regions(full_turns)
     label_of = {v: k for k, v in names.items()}
     counts: dict = {}
@@ -360,13 +371,16 @@ def signatures(audio, full_turns, names, segments, cancel) -> list[dict]:
             for vm in models["voices"]:
                 if cancel.is_set():
                     raise Cancelled()
-                vec, used = vm.signature(audio, regions, SAMPLE_RATE)
-                if vec is not None and used >= VOICE_MIN_SECONDS:
+                if vm.entry["method"] == "pipeline-centroid-v1":
+                    vec = unit(centroids.get(label_of[label]) or [])
+                else:
+                    vec, used = vm.signature(audio, regions, SAMPLE_RATE)
+                    if used < VOICE_MIN_SECONDS:
+                        vec = None
+                if vec is not None:
                     entry["embeddings"].append({"model": vm.entry["model"], "version": vm.entry["version"],
                                                 "vector": [round(x, 6) for x in vec]})
-                    entry["speech_seconds"] = round(max(entry["speech_seconds"], used), 1)
-        if not entry["embeddings"]:
-            entry["speech_seconds"] = round(available, 1)
+        entry["speech_seconds"] = round(available, 1)
         out.append(entry)
     return out
 
@@ -380,7 +394,7 @@ def run_job(audio, cancel, language, prompt, speakers, want_voice, job_id="direc
             on_start()
         try:
             t0 = time.monotonic()
-            turns, full_turns = diarize(audio, cancel, **speakers)
+            turns, full_turns, centroids = diarize(audio, cancel, **speakers)
             t1 = time.monotonic()
             words, detected = transcribe_words(audio, cancel, language, prompt)
             t2 = time.monotonic()
@@ -388,7 +402,7 @@ def run_job(audio, cancel, language, prompt, speakers, want_voice, job_id="direc
             segments = assign_speakers(words, turns, names)
             if not segments:
                 raise ApiError(422, "no_speech", "no speech was found in the audio")
-            voice = signatures(audio, full_turns, names, segments, cancel) if want_voice else None
+            voice = signatures(audio, full_turns, centroids, names, segments, cancel) if want_voice else None
             t3 = time.monotonic()
         finally:
             current.clear()

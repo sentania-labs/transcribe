@@ -48,3 +48,8 @@ def test_parse_voice_models():
                 json.dumps([{**ENTRY, "method": "nope"}]), json.dumps([ENTRY, ENTRY])):
         with pytest.raises(VoiceConfigError):
             parse_voice_models(bad)
+
+
+def test_parse_pipeline_centroid_method():
+    (e,) = parse_voice_models(json.dumps([{**ENTRY, "method": "pipeline-centroid-v1"}]))
+    assert e["version"] == "r1+pipeline-centroid-v1"

@@ -85,7 +85,9 @@ def main():
             i += 2
         t0 = time.monotonic()
         audio = load(audio_path, start, end)
-        out = pipe({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": RATE})
+        hint = {k: int(os.environ[k.upper()]) for k in ("num_speakers", "min_speakers", "max_speakers")
+                if os.environ.get(k.upper())}
+        out = pipe({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": RATE}, **hint)
         t1 = time.monotonic()
         turns = [(t.start, t.end, spk) for t, _, spk in out.speaker_diarization.itertracks(yield_label=True)]
         clean = clean_regions(turns)
