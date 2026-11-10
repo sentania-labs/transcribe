@@ -72,7 +72,9 @@ SAMPLE_RATE = 16000
 MAX_SECONDS = float(os.environ.get("MAX_SECONDS", 2.5 * 3600))
 DIRECT_MAX_SECONDS = min(MAX_SECONDS, float(os.environ.get("DIRECT_MAX_SECONDS", 8400)))
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 1024**3))
-MAX_JOBS = int(os.environ.get("MAX_JOBS", 1))
+# One job at a time, fixed: the CPU lock already serialises jobs, so a second
+# slot would only let a caller wait behind a running job past its timeout.
+MAX_JOBS = 1
 JOB_TTL = float(os.environ.get("JOB_TTL", 2 * 3600))
 # Seconds of work per second of audio, for Retry-After (measured 0.41 on 4 CPUs).
 WORK_RATIO = float(os.environ.get("WORK_RATIO", 0.45))
@@ -86,6 +88,7 @@ AUDIO_FORMATS = {"mp3", "wav", "flac", "ogg", "matroska", "webm", "mov", "mp4", 
 app = FastAPI(title="transcribe", docs_url=None, redoc_url=None, openapi_url=None)
 models: dict = {}
 model_error = "loading"
+voice_error = ""              # voice models unusable: signatures refused, transcription still works
 model_info: dict = {}
 cpu_lock = threading.Lock()   # one job on the CPU at a time, whatever MAX_JOBS says
 jobs = asyncio.Semaphore(MAX_JOBS)
@@ -114,10 +117,17 @@ class ApiError(Exception):
 
 def retry_after() -> int:
     """Seconds until the running job should finish (estimate), at least 30."""
-    if not current:
+    c = dict(current)  # one snapshot: the worker clears it concurrently
+    if not c:
         return 30
-    remaining = current["audio_seconds"] * WORK_RATIO - (time.monotonic() - current["started"])
+    remaining = c["audio_seconds"] * WORK_RATIO - (time.monotonic() - c["started"])
     return int(min(3600, max(30, remaining)))
+
+
+def claim(upload_bytes: int):
+    """A slot was taken: estimate the job before its audio is decoded
+    (64 kbps assumed; corrected once decoded)."""
+    current.update(started=time.monotonic(), audio_seconds=upload_bytes / 8000)
 
 
 def busy() -> ApiError:
@@ -143,21 +153,14 @@ async def validation_error(request, exc):
     return ApiError(400, "invalid_request", f"invalid or missing fields: {', '.join(fields)}").response()
 
 
-@app.exception_handler(Exception)
-async def internal_error(request, exc):
-    log.error("internal error on %s: %s", request.url.path, type(exc).__name__)
-    return ApiError(500, "internal", "internal error").response()
-
-
 def load_models():
     """Load every model, retrying until their files exist (the volume is seeded by hand)."""
-    global model_error
+    global model_error, voice_error
     try:
         voice_entries = parse_voice_models(VOICE_MODELS_RAW)
     except VoiceConfigError as e:
-        model_error = f"voice model config: {e}"
-        log.error("%s", model_error)
-        return
+        voice_entries, voice_error = [], f"voice model config: {e}"
+        log.error("%s", voice_error)
     while True:
         missing = [p for p in (os.path.join(PIPELINE_PATH, "config.yaml"),
                                os.path.join(WHISPER_PATH, "model.bin")) if not os.path.exists(p)]
@@ -180,7 +183,6 @@ def load_models():
             pipeline._segmentation.step = DIARIZATION_STEP * pipeline._segmentation.duration
             whisper = WhisperModel(WHISPER_PATH, device="cpu", compute_type=COMPUTE_TYPE,
                                    cpu_threads=THREADS, num_workers=1)
-            voices = [VoiceModel(e, THREADS, os.path.join(PIPELINE_PATH, "embedding")) for e in voice_entries]
         except VoiceConfigError as e:  # wrong files on the volume: do not retry into a loop
             model_error = str(e)
             log.error("%s", model_error)
@@ -190,6 +192,14 @@ def load_models():
             log.exception("model load failed; retrying in 60 s")
             time.sleep(60)
             continue
+        # Voice models last, and on their own: a bad entry disables signatures
+        # (requests that ask for them get `internal`), never transcription.
+        voices = []
+        try:
+            voices = [VoiceModel(e, THREADS, PIPELINE_PATH, DIARIZATION_STEP) for e in voice_entries]
+        except VoiceConfigError as e:
+            voice_error = str(e)
+            log.error("voice models disabled: %s", voice_error)
         models.update(pipeline=pipeline, whisper=whisper, voices=voices)
         model_info.update(
             transcription={"model": WHISPER_ID, "version": WHISPER_REVISION or None,
@@ -220,7 +230,9 @@ def job_view(job: dict) -> dict:
 
 
 class Gate:
-    """Plain ASGI middleware: refuse before a byte of the body is read.
+    """Plain ASGI middleware, outermost: refuse before a byte of the body is
+    read, and turn any unhandled exception into a plain `internal` error with
+    no traceback in the log (Starlette's error middleware would log one).
 
     Not @app.middleware("http"): that wrapper hides the client's disconnect
     from request.is_disconnected(), and a cancelled request would then hold
@@ -234,7 +246,25 @@ class Gate:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["path"] == "/health":
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        started = False
+
+        async def tracked(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.check(scope, receive, tracked)
+        except Exception as e:
+            log.error("internal error on %s: %s", scope.get("path"), type(e).__name__)
+            if not started:
+                await ApiError(500, "internal", "internal error").response()(scope, receive, send)
+
+    async def check(self, scope, receive, send):
+        if scope["path"] == "/health":
             return await self.app(scope, receive, send)
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
         token = headers.get("authorization", "").removeprefix("Bearer ").strip()
@@ -243,7 +273,7 @@ class Gate:
             err = ApiError(401, "unauthorized", "invalid api key")
         elif scope["method"] == "POST" and scope["path"].startswith("/v1/audio/transcriptions"):
             key = headers.get("idempotency-key", "")
-            if scope["path"].endswith("/jobs") and key in idempotency and idempotency[key] in async_jobs:
+            if scope["path"].endswith("/jobs") and idempotency.get(key) in async_jobs:
                 job = async_jobs[idempotency[key]]
                 return await JSONResponse(job_view(job), status_code=200)(scope, receive, send)
             length = headers.get("content-length", "")
@@ -389,7 +419,7 @@ def run_job(audio, cancel, language, prompt, speakers, want_voice, job_id="direc
     """The CPU part of a job. Returns everything the formatter needs."""
     duration = len(audio) / SAMPLE_RATE
     with cpu_lock:
-        current.update(started=time.monotonic(), audio_seconds=duration)
+        current.update(audio_seconds=duration)
         if on_start:
             on_start()
         try:
@@ -440,6 +470,8 @@ def check_request(response_format, want_voice):
         raise ApiError(400, "invalid_request", f"unsupported response_format {response_format!r}")
     if want_voice and response_format == "text":
         raise ApiError(400, "invalid_request", "include_speaker_embeddings needs a JSON response_format")
+    if want_voice and voice_error:
+        raise ApiError(503, "internal", "voice models unavailable; see /v1/status", {"Retry-After": "300"})
     if model_error:
         raise ApiError(503, "internal", "models not loaded", {"Retry-After": "60"})
     if jobs.locked():
@@ -456,7 +488,10 @@ async def receive(file: UploadFile, limit: float, path_name: str) -> np.ndarray:
         size = os.fstat(spool.fileno()).st_size
         if size > MAX_UPLOAD_BYTES:
             raise ApiError(413, "too_long", f"upload larger than {MAX_UPLOAD_BYTES} bytes")
-        return await asyncio.to_thread(decode, spool.fileno(), limit, path_name)
+        claim(size)
+        audio = await asyncio.to_thread(decode, spool.fileno(), limit, path_name)
+        current.update(audio_seconds=len(audio) / SAMPLE_RATE)
+        return audio
     finally:
         await file.close()
 
@@ -478,6 +513,7 @@ async def status():
     return {
         "ready": not model_error,
         "detail": model_error or None,
+        "voice_error": voice_error or None,
         "busy": jobs.locked(),
         "retry_after": retry_after() if jobs.locked() else None,
         "models": model_info or None,
@@ -507,7 +543,11 @@ async def transcriptions(
 ):
     check_request(response_format, include_speaker_embeddings)
     async with jobs:
-        audio = await receive(file, DIRECT_MAX_SECONDS, "direct")
+        try:
+            audio = await receive(file, DIRECT_MAX_SECONDS, "direct")
+        except BaseException:
+            current.clear()
+            raise
         cancel = threading.Event()
 
         async def watch():
@@ -549,20 +589,26 @@ async def submit_job(
     key = request.headers.get("idempotency-key") or idempotency_key or None
     if key is not None and not IDEMPOTENCY_KEY.match(key):
         raise ApiError(400, "invalid_request", "idempotency key: 1-128 of A-Z a-z 0-9 . _ : -")
-    if key and key in idempotency and idempotency[key] in async_jobs:
+    if key and idempotency.get(key) in async_jobs:
         await file.close()
         return JSONResponse(job_view(async_jobs[idempotency[key]]), status_code=200)
     check_request(response_format, include_speaker_embeddings)
     await jobs.acquire()
-    try:
-        audio = await receive(file, MAX_SECONDS, "job")
-    except BaseException:
-        jobs.release()
-        raise
+    # The job exists, and owns its key, from the moment it holds the slot, so a
+    # repeat arriving while this upload decodes finds it instead of a second run.
     job_id = uuid.uuid4().hex
     job = async_jobs[job_id] = {"id": job_id, "status": "queued", "created": time.time()}
     if key:
         idempotency[key] = job_id
+    try:
+        audio = await receive(file, MAX_SECONDS, "job")
+    except BaseException:
+        async_jobs.pop(job_id, None)
+        if key and idempotency.get(key) == job_id:
+            idempotency.pop(key, None)
+        current.clear()
+        jobs.release()
+        raise
     log.info("job %s queued: audio %.0f s", job_id, len(audio) / SAMPLE_RATE)
 
     def started():
@@ -581,6 +627,10 @@ async def submit_job(
             log.error("job %s failed: internal %s", job_id, type(e).__name__)
             job.update(status="failed", error={"reason": "internal", "message": "internal error"})
         finally:
+            # `internal` is retryable: free the key so a resubmit with it runs
+            # again (the failed job stays readable by id until purged).
+            if job.get("error", {}).get("reason") == "internal" and key and idempotency.get(key) == job_id:
+                idempotency.pop(key, None)
             job["finished"] = time.time()
             jobs.release()
 

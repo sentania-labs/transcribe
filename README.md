@@ -49,7 +49,7 @@ curl -H "Authorization: Bearer $KEY" -F file=@meeting.m4a -F response_format=dia
 | `model`, `chunking_strategy` | accepted and ignored (one model is served; chunking is internal) |
 | `language` | ISO code; detected from the first window when absent |
 | `prompt` | Whisper initial prompt: names and terms to spell right; applies to the start of each 20-minute window |
-| `num_speakers`, `min_speakers`, `max_speakers` | speaker-count hints for pyannote |
+| `num_speakers`, `min_speakers`, `max_speakers` | speaker-count hints for pyannote. For an attendee list prefer `max_speakers`: invitees who never speak make `num_speakers` an over-count, which adds stray labels (measured, `docs/voice-eval.md`) |
 | `include_speaker_embeddings` | `true` adds `speakers` (below); JSON formats only |
 
 Response (`diarized_json`; `verbose_json` is the same with plain segments, `{id, speaker,
@@ -65,7 +65,7 @@ start, end, text}`):
   "speakers": [
     {"label": "Speaker 1", "speech_seconds": 300.0, "segment_count": 14,
      "embeddings": [{"model": "pyannote/speaker-diarization-community-1/embedding",
-                     "version": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee+pipeline-centroid-v1",
+                     "version": "3533c8cf8e369892e6b79ff1bf80f7b0286a54ee+pipeline-centroid-v1+<12 hex>",
                      "vector": [0.0123, -0.0456, "... 256 numbers"]}]}
   ]
 }
@@ -87,7 +87,8 @@ The text is `Speaker N: ...` lines; `text` format returns only that.
 `POST /v1/audio/transcriptions/jobs` takes the same form plus an optional idempotency key
 (header `Idempotency-Key`, or form field `idempotency_key`; 1-128 of `A-Z a-z 0-9 . _ : -`).
 It answers `202` with the job; a repeat with a known key answers `200` with the existing
-job, whatever its state, until that job is purged. With the header, a repeat is answered
+job, whatever its state, until that job is purged. Exception: a job that failed with
+`internal` (retryable) releases its key, so a resubmit with the same key runs again. With the header, a repeat is answered
 before the upload is read, even while the service is busy; with only the form field, a
 repeat sent while busy gets `429 busy` (the key is in the body, which is not read then).
 
@@ -146,9 +147,14 @@ signatures (`embeddings` is always empty). Each entry:
 
 `model` names where the weights come from (community-1's `embedding/`, itself a copy of
 `pyannote/wespeaker-voxceleb-resnet34-LM`) and `revision` is that repository's commit. The
-reported `version` is `<revision>+<method>`. The service hashes the weights at start
-and refuses to serve (status `ready: false`) when a hash does not match, so swapping files
-on the volume cannot silently change what a vector means. A changeover is a second entry:
+reported `version` is `<revision>+<method>+<fingerprint>`. The fingerprint (12 hex) is
+computed at start over everything that shapes the vector: the weights, and for
+`pipeline-centroid-v1` also the pipeline's `config.yaml` (clustering settings),
+segmentation weights, `plda/` files and `DIARIZATION_STEP`. New weights or a re-tuned
+pipeline therefore always give a new version, even if `revision` is not edited. A weights
+file that does not match the configured `sha256` disables signatures (status
+`voice_error`; requests with `include_speaker_embeddings=true` get `503 internal`) while
+transcription keeps working. A changeover is a second entry:
 both run and each speaker gets two vectors; removing the old entry ends it. Changing
 `VOICE_MODELS` is the only way to change voice models: an image update keeps the vectors
 identical as long as it supports the configured `method` (an image that drops a method
@@ -170,8 +176,9 @@ Methods:
 ## Privacy
 
 No audio, transcript, prompt or vector is written to logs at any level (library loggers
-are held at WARNING; errors log the reason code and exception type only; ffmpeg's messages
-are not passed on because they can quote file metadata). Logs carry job ids, durations,
+are held at WARNING; every unhandled error is caught by the outermost middleware and logs
+the path and exception type only, no traceback; ffmpeg's messages are not passed on
+because they can quote file metadata; validation errors name fields, never values). Logs carry job ids, durations,
 sizes, counts and reasons. Uploads are deleted once decoded. Nothing is kept after the
 answer except a job's result until it is purged.
 
@@ -183,7 +190,6 @@ answer except a job's result until it is purged.
 | `MAX_UPLOAD_BYTES` | 1 GiB | larger uploads: `too_long` |
 | `DIRECT_MAX_SECONDS` | 8400 | audio limit on the direct path (a synchronous call must end inside the ingress's 3600 s) |
 | `MAX_SECONDS` | 9000 | audio limit on the job path |
-| `MAX_JOBS` | 1 | more at once: `busy`, before the upload is read |
 | `JOB_TTL` | 7200 | seconds a finished job's result is kept |
 | `VOICE_MODELS` | empty | voice models, above |
 | `VOICE_MIN_SECONDS` | 20 | clean speech needed for a signature |

@@ -15,9 +15,12 @@ the image, so an image update cannot change what a vector means. Each entry:
   path      directory of the embedding model (pytorch_model.bin inside)
   sha256    of pytorch_model.bin; the service refuses the entry on a mismatch
 
-The reported version is "<revision>+<method>": a different method gives
-vectors that must not be compared with the old ones, so it is a different
-version. Two entries during a changeover give two vectors per speaker.
+The reported version is "<revision>+<method>+<fingerprint>". The fingerprint
+is a hash, computed at start, of everything that shapes the vector: the
+weights, and for pipeline-centroid-v1 also the pipeline's config.yaml,
+segmentation weights, plda files and the diarization step. So new weights or a
+re-tuned pipeline always give a new version, even if nobody edits `revision`.
+Two entries during a changeover give two vectors per speaker.
 """
 import hashlib
 import json
@@ -65,12 +68,26 @@ def parse_voice_models(raw: str | None) -> list[dict]:
             raise VoiceConfigError(f"VOICE_MODELS entry missing {', '.join(missing)}")
         if e["method"] not in METHODS:
             raise VoiceConfigError(f"unknown voice method {e['method']!r} (this image knows {', '.join(METHODS)})")
-        version = f"{e['revision']}+{e['method']}"
-        if (e["model"], version) in seen:
-            raise VoiceConfigError(f"VOICE_MODELS lists {e['model']} {version} twice")
-        seen.add((e["model"], version))
-        out.append({**e, "version": version})
+        key = (e["model"], e["revision"], e["method"], e["sha256"])
+        if key in seen:
+            raise VoiceConfigError(f"VOICE_MODELS lists {e['model']} {e['revision']} {e['method']} twice")
+        seen.add(key)
+        # The final version gets the fingerprint at load time (VoiceModel).
+        out.append({**e, "version": f"{e['revision']}+{e['method']}"})
     return out
+
+
+def fingerprint(entry: dict, pipeline_dir: str | None, step: float) -> str:
+    """12 hex characters over every input that shapes this entry's vectors."""
+    h = hashlib.sha256()
+    h.update(f"{entry['method']}|{entry['sha256']}".encode())
+    if entry["method"] == "pipeline-centroid-v1":
+        files = ["config.yaml", "segmentation/pytorch_model.bin", "plda/plda.npz", "plda/xvec_transform.npz"]
+        for f in files:
+            p = os.path.join(pipeline_dir, f)
+            h.update(f"|{f}:{file_sha256(p) if os.path.exists(p) else 'missing'}".encode())
+        h.update(f"|step:{step}".encode())
+    return h.hexdigest()[:12]
 
 
 def file_sha256(path: str) -> str:
@@ -162,23 +179,32 @@ class VoiceModel:
     pipeline uses; a pipeline-centroid-v1 entry must point at exactly it.
     """
 
-    def __init__(self, entry: dict, threads: int, pipeline_embedding: str | None = None):
+    def __init__(self, entry: dict, threads: int, pipeline_dir: str | None = None, step: float = 0.0):
         weights = os.path.join(entry["path"], "pytorch_model.bin")
+        if not os.path.exists(weights):
+            raise VoiceConfigError(f"{entry['model']}: {weights} missing")
         digest = file_sha256(weights)
         if digest != entry["sha256"]:
             raise VoiceConfigError(f"{entry['model']}: pytorch_model.bin sha256 {digest[:12]} "
                                    f"does not match the configured {entry['sha256'][:12]}")
-        self.entry = entry
+        self.entry = {**entry, "version": f"{entry['version']}+{fingerprint(entry, pipeline_dir, step)}"}
         self.embedding = None
         if entry["method"] == "pipeline-centroid-v1":
-            if not pipeline_embedding or os.path.realpath(entry["path"]) != os.path.realpath(pipeline_embedding):
+            own = os.path.join(pipeline_dir or "", "embedding")
+            if not pipeline_dir or os.path.realpath(entry["path"]) != os.path.realpath(own):
                 raise VoiceConfigError(f"{entry['model']}: pipeline-centroid-v1 needs the path of the "
-                                       f"diarization pipeline's own embedding model ({pipeline_embedding})")
+                                       f"diarization pipeline's own embedding model ({own})")
             return
-        import torch
-        from pyannote.audio.pipelines.speaker_verification import PretrainedSpeakerEmbedding
-        torch.set_num_threads(threads)
-        self.embedding = PretrainedSpeakerEmbedding(entry["path"], device=torch.device("cpu"))
+        try:
+            import torch
+            # The pyannote loader class directly: PretrainedSpeakerEmbedding()
+            # picks a backend by substring of the path ("wespeaker", "nvidia",
+            # ...), which could load something other than the file hashed above.
+            from pyannote.audio.pipelines.speaker_verification import PyannoteAudioPretrainedSpeakerEmbedding
+            torch.set_num_threads(threads)
+            self.embedding = PyannoteAudioPretrainedSpeakerEmbedding(entry["path"], device=torch.device("cpu"))
+        except Exception as e:
+            raise VoiceConfigError(f"{entry['model']}: could not load ({type(e).__name__})") from None
 
     def embed(self, audio, windows, rate: int, batch: int = 16):
         """[(start, end)] seconds -> [vector or None], one per window."""
