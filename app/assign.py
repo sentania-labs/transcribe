@@ -122,7 +122,7 @@ def split_runs(sent, turns, starts, longest):
     return [r[1] for r in runs]
 
 
-def assign_speakers(words, turns):
+def assign_speakers(words, turns, names=None):
     """words [(start, end, text)], turns [(start, end, speaker)] -> segments.
 
     Each sentence goes to the speaker who covers most of its words' time.
@@ -130,13 +130,15 @@ def assign_speakers(words, turns):
     Whisper's and pyannote's timings disagree by a fraction of a second; whole
     sentences do not. A run of one speaker's sentences is a segment, split at a
     pause of PAUSE_SPLIT or when it would pass MAX_SEGMENT. Speakers are renamed
-    "Speaker N" in order of first speech.
+    "Speaker N" in order of first speech; pass a dict as `names` to get the
+    diarization label -> "Speaker N" map back (voice signatures need it).
     """
     turns = sorted(turns)
     starts = [t[0] for t in turns]
     longest = max((e - s for s, e, _ in turns), default=0.0)
     pieces = [p for sent in sentences(words) for p in split_runs(sent, turns, starts, longest)]
-    names, segments, cur = {}, [], None
+    names = {} if names is None else names
+    segments, cur = [], None
     for sent in pieces:
         votes = {}
         for start, end, _ in sent:

@@ -1,41 +1,31 @@
-"""transcribe: CPU speech-to-text with speaker labels, OpenAI-compatible.
+"""transcribe: CPU speech-to-text with speaker labels and optional voice signatures.
 
-POST /v1/audio/transcriptions (multipart, the OpenAI shape). Two passes over
-the whole recording, both on the CPU:
+POST /v1/audio/transcriptions (multipart, the OpenAI shape). Passes over the
+recording, all on the CPU, one job at a time:
 
   1. pyannote speaker-diarization-community-1 labels who speaks when;
-  2. faster-whisper (CTranslate2, int8) transcribes the recording once, with
-     word timestamps and its VAD filter.
+  2. faster-whisper (CTranslate2, int8) transcribes it in windows, with word
+     timestamps and its VAD filter; each sentence goes to the speaker who
+     covers most of its words (app/assign.py);
+  3. only when include_speaker_embeddings=true: one voice signature per
+     speaker and configured voice model, from clean speech (app/voice.py).
 
-Each word then goes to the speaker whose turn overlaps it most, and runs of
-one speaker's words become segments. Transcribing turn by turn (the GPU
-version on the Spark did that) costs a full 30-second encoder pass for every
-short turn, which on a CPU is several times the work of one pass over the
-recording.
+Formats: json, text, verbose_json, diarized_json. Long recordings go to the job
+path (POST /v1/audio/transcriptions/jobs, GET .../jobs/{id}); its result is the
+same JSON as the direct call. Every error is {"error": {"reason", "message"}}
+with a stable reason (README.md). GET /v1/status reports models, limits and
+whether a job is running.
 
-response_format:
-  json (default)  {"text": "Speaker 1: ...\\nSpeaker 2: ...", "usage": ...}
-  text            the same text, plain
-  verbose_json    task, language, duration, text, segments [{id, speaker, start, end, text}]
-  diarized_json   task, duration, text, segments [{type, id, speaker, start, end, text}], usage
-Optional form fields: language, prompt (Whisper initial prompt), num_speakers,
-min_speakers, max_speakers (passed to pyannote).
-
-Long recordings: POST /v1/audio/transcriptions/jobs takes the same form and
-answers 202 {"id", "status"} at once; GET /v1/audio/transcriptions/jobs/{id}
-returns the status and, when done, the result in the requested format. Jobs
-live in memory for JOB_TTL seconds and are lost on restart.
-
-Auth: TRANSCRIBE_API_KEY as a bearer token, checked before any of the upload
-is read. Limits: MAX_UPLOAD_BYTES per upload, MAX_SECONDS of audio, MAX_JOBS
-jobs at once (more get 429). A synchronous request whose client goes away is
-cancelled at the next progress step.
+Privacy: no audio, transcript, prompt or vector is ever logged or kept,
+except a finished job's result for JOB_TTL seconds in memory. Logs carry job
+ids, durations, sizes and reasons only.
 """
 import asyncio
 import hmac
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -43,17 +33,28 @@ import time
 import uuid
 
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.assign import assign_speakers, cpu_limit, windows
+from app.voice import VoiceConfigError, VoiceModel, clean_regions, file_sha256, parse_voice_models, unit
 
 log = logging.getLogger("transcribe")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+# Library loggers stay at WARNING: none of them is allowed to put text in the log.
+for name in ("faster_whisper", "pyannote", "speechbrain", "lightning", "pytorch_lightning"):
+    logging.getLogger(name).setLevel(logging.WARNING)
 
 API_KEY = os.environ["TRANSCRIBE_API_KEY"]
 PIPELINE_PATH = os.environ.get("DIARIZATION_PIPELINE", "/models/pyannote/speaker-diarization-community-1")
+PIPELINE_ID = os.environ.get("DIARIZATION_MODEL_ID", "pyannote/speaker-diarization-community-1")
+PIPELINE_REVISION = os.environ.get("DIARIZATION_MODEL_REVISION", "")
 WHISPER_PATH = os.environ.get("WHISPER_MODEL", "/models/whisper/large-v3-turbo")
+WHISPER_ID = os.environ.get("WHISPER_MODEL_ID", "large-v3-turbo")
+WHISPER_REVISION = os.environ.get("WHISPER_MODEL_REVISION", "")
+WHISPER_SHA256 = os.environ.get("WHISPER_MODEL_SHA256", "")
 COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8")
 BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", 5))
 # pyannote slides a 10 s window by this fraction of it. The speaker embedding
@@ -62,12 +63,23 @@ BEAM_SIZE = int(os.environ.get("WHISPER_BEAM_SIZE", 5))
 DIARIZATION_STEP = float(os.environ.get("DIARIZATION_STEP", 0.25))
 THREADS = int(os.environ.get("THREADS") or cpu_limit())
 WHISPER_WINDOW = float(os.environ.get("WHISPER_WINDOW", 1200))
+VOICE_MODELS_RAW = os.environ.get("VOICE_MODELS", "")
+# Clean speech a speaker needs before a signature is returned (docs/voice-eval.md).
+VOICE_MIN_SECONDS = float(os.environ.get("VOICE_MIN_SECONDS", 20))
 SAMPLE_RATE = 16000
+# Job path limit, and the direct path's (a synchronous call has to finish
+# inside the ingress's 3600 s; at ~0.41 x audio length that is about 2h20m).
 MAX_SECONDS = float(os.environ.get("MAX_SECONDS", 2.5 * 3600))
+DIRECT_MAX_SECONDS = min(MAX_SECONDS, float(os.environ.get("DIRECT_MAX_SECONDS", 8400)))
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", 1024**3))
-MAX_JOBS = int(os.environ.get("MAX_JOBS", 1))
-JOB_TTL = float(os.environ.get("JOB_TTL", 24 * 3600))
+# One job at a time, fixed: the CPU lock already serialises jobs, so a second
+# slot would only let a caller wait behind a running job past its timeout.
+MAX_JOBS = 1
+JOB_TTL = float(os.environ.get("JOB_TTL", 2 * 3600))
+# Seconds of work per second of audio, for Retry-After (measured 0.41 on 4 CPUs).
+WORK_RATIO = float(os.environ.get("WORK_RATIO", 0.45))
 FORMATS = ("json", "text", "verbose_json", "diarized_json")
+IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 # Containers ffmpeg may read. Playlists and concat lists (hls, concat, ...) are
 # refused: they make ffmpeg open other files.
 AUDIO_FORMATS = {"mp3", "wav", "flac", "ogg", "matroska", "webm", "mov", "mp4", "m4a",
@@ -76,18 +88,79 @@ AUDIO_FORMATS = {"mp3", "wav", "flac", "ogg", "matroska", "webm", "mov", "mp4", 
 app = FastAPI(title="transcribe", docs_url=None, redoc_url=None, openapi_url=None)
 models: dict = {}
 model_error = "loading"
+voice_error = ""              # voice models unusable: signatures refused, transcription still works
+model_info: dict = {}
 cpu_lock = threading.Lock()   # one job on the CPU at a time, whatever MAX_JOBS says
 jobs = asyncio.Semaphore(MAX_JOBS)
+current: dict = {}            # the running job: started (monotonic), audio_seconds
 async_jobs: dict[str, dict] = {}
+idempotency: dict[str, str] = {}   # caller key -> job id, purged with the job
 
 
 class Cancelled(Exception):
     pass
 
 
+class ApiError(Exception):
+    """An error with a stable reason code. The message never carries audio-derived text."""
+
+    def __init__(self, status: int, reason: str, message: str, headers: dict | None = None):
+        super().__init__(message)
+        self.status, self.reason, self.message, self.headers = status, reason, message, headers or {}
+
+    def body(self):
+        return {"error": {"reason": self.reason, "message": self.message}}
+
+    def response(self):
+        return JSONResponse(self.body(), status_code=self.status, headers=self.headers)
+
+
+def retry_after() -> int:
+    """Seconds until the running job should finish (estimate), at least 30."""
+    c = dict(current)  # one snapshot: the worker clears it concurrently
+    if not c:
+        return 30
+    remaining = c["audio_seconds"] * WORK_RATIO - (time.monotonic() - c["started"])
+    return int(min(3600, max(30, remaining)))
+
+
+def claim(upload_bytes: int):
+    """A slot was taken: estimate the job before its audio is decoded
+    (64 kbps assumed; corrected once decoded)."""
+    current.update(started=time.monotonic(), audio_seconds=upload_bytes / 8000)
+
+
+def busy() -> ApiError:
+    return ApiError(429, "busy", "a transcription is already running; retry later",
+                    {"Retry-After": str(retry_after())})
+
+
+@app.exception_handler(ApiError)
+async def api_error(request, exc: ApiError):
+    return exc.response()
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request, exc):
+    reason = {404: "not_found", 405: "invalid_request"}.get(exc.status_code, "invalid_request")
+    return ApiError(exc.status_code, reason, str(exc.detail)).response()
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, exc):
+    # Field names only: the default handler echoes the submitted values back.
+    fields = sorted({".".join(str(p) for p in e.get("loc", [])[1:]) for e in exc.errors()})
+    return ApiError(400, "invalid_request", f"invalid or missing fields: {', '.join(fields)}").response()
+
+
 def load_models():
-    """Load both models, retrying until their files exist (the volume is seeded by hand)."""
-    global model_error
+    """Load every model, retrying until their files exist (the volume is seeded by hand)."""
+    global model_error, voice_error
+    try:
+        voice_entries = parse_voice_models(VOICE_MODELS_RAW)
+    except VoiceConfigError as e:
+        voice_entries, voice_error = [], f"voice model config: {e}"
+        log.error("%s", voice_error)
     while True:
         missing = [p for p in (os.path.join(PIPELINE_PATH, "config.yaml"),
                                os.path.join(WHISPER_PATH, "model.bin")) if not os.path.exists(p)]
@@ -101,20 +174,43 @@ def load_models():
             from faster_whisper import WhisperModel
             from pyannote.audio import Pipeline
             torch.set_num_threads(THREADS)
+            whisper_sha = file_sha256(os.path.join(WHISPER_PATH, "model.bin"))
+            if WHISPER_SHA256 and whisper_sha != WHISPER_SHA256:
+                raise VoiceConfigError(f"whisper model.bin sha256 {whisper_sha[:12]} does not match "
+                                       f"the configured {WHISPER_SHA256[:12]}")
             pipeline = Pipeline.from_pretrained(PIPELINE_PATH)
             pipeline.to(torch.device("cpu"))
             pipeline._segmentation.step = DIARIZATION_STEP * pipeline._segmentation.duration
             whisper = WhisperModel(WHISPER_PATH, device="cpu", compute_type=COMPUTE_TYPE,
                                    cpu_threads=THREADS, num_workers=1)
+        except VoiceConfigError as e:  # wrong files on the volume: do not retry into a loop
+            model_error = str(e)
+            log.error("%s", model_error)
+            return
         except Exception as e:  # keep serving /health with the reason
-            model_error = f"model load failed: {e!r}"[:500]
+            model_error = f"model load failed: {type(e).__name__}"
             log.exception("model load failed; retrying in 60 s")
             time.sleep(60)
             continue
-        models.update(pipeline=pipeline, whisper=whisper)
+        # Voice models last, and on their own: a bad entry disables signatures
+        # (requests that ask for them get `internal`), never transcription.
+        voices = []
+        try:
+            voices = [VoiceModel(e, THREADS, PIPELINE_PATH, DIARIZATION_STEP) for e in voice_entries]
+        except VoiceConfigError as e:
+            voice_error = str(e)
+            log.error("voice models disabled: %s", voice_error)
+        models.update(pipeline=pipeline, whisper=whisper, voices=voices)
+        model_info.update(
+            transcription={"model": WHISPER_ID, "version": WHISPER_REVISION or None,
+                           "sha256": whisper_sha, "compute_type": COMPUTE_TYPE},
+            diarization={"model": PIPELINE_ID, "version": PIPELINE_REVISION or None,
+                         "step": DIARIZATION_STEP},
+            voice=[{"model": v.entry["model"], "version": v.entry["version"],
+                    "sha256": v.entry["sha256"]} for v in voices])
         model_error = ""
-        log.info("models loaded: threads=%d compute_type=%s beam=%d diarization_step=%s",
-                 THREADS, COMPUTE_TYPE, BEAM_SIZE, DIARIZATION_STEP)
+        log.info("models loaded: threads=%d compute_type=%s beam=%d diarization_step=%s voice_models=%d",
+                 THREADS, COMPUTE_TYPE, BEAM_SIZE, DIARIZATION_STEP, len(voices))
         return
 
 
@@ -124,52 +220,86 @@ async def startup():
     app.state.reaper = asyncio.create_task(reap_jobs())
 
 
+def job_view(job: dict) -> dict:
+    out = {k: job[k] for k in ("id", "status", "created", "started", "finished") if job.get(k)}
+    if job["status"] == "failed":
+        out["error"] = job["error"]
+    if job["status"] == "done":
+        out["result"] = job["result"]
+    return out
+
+
 class Gate:
-    """Plain ASGI middleware: refuse before a byte of the body is read.
+    """Plain ASGI middleware, outermost: refuse before a byte of the body is
+    read, and turn any unhandled exception into a plain `internal` error with
+    no traceback in the log (Starlette's error middleware would log one).
 
     Not @app.middleware("http"): that wrapper hides the client's disconnect
     from request.is_disconnected(), and a cancelled request would then hold
     every CPU until its job ended. Checked here, in order: the key (401); for
-    an upload, a Content-Length (411: without one the size is unknown until
-    the body has been spooled to disk) within MAX_UPLOAD_BYTES (413), models
-    loaded (503), a free job slot (429).
+    an upload, a known Idempotency-Key header on the job path (answer with
+    that job, no upload read), a Content-Length (411) within MAX_UPLOAD_BYTES
+    (413), models loaded (503), a free job slot (429 busy, with Retry-After).
     """
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope["path"] == "/health":
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        started = False
+
+        async def tracked(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+            await send(message)
+
+        try:
+            await self.check(scope, receive, tracked)
+        except Exception as e:
+            log.error("internal error on %s: %s", scope.get("path"), type(e).__name__)
+            if not started:
+                await ApiError(500, "internal", "internal error").response()(scope, receive, send)
+
+    async def check(self, scope, receive, send):
+        if scope["path"] == "/health":
             return await self.app(scope, receive, send)
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
         token = headers.get("authorization", "").removeprefix("Bearer ").strip()
-        status, message = 0, ""
+        err = None
         if not hmac.compare_digest(token.encode(), API_KEY.encode()):
-            status, message = 401, "invalid api key"
+            err = ApiError(401, "unauthorized", "invalid api key")
         elif scope["method"] == "POST" and scope["path"].startswith("/v1/audio/transcriptions"):
+            key = headers.get("idempotency-key", "")
+            if scope["path"].endswith("/jobs") and idempotency.get(key) in async_jobs:
+                job = async_jobs[idempotency[key]]
+                return await JSONResponse(job_view(job), status_code=200)(scope, receive, send)
             length = headers.get("content-length", "")
             if not length.isdigit():
-                status, message = 411, "Content-Length required"
+                err = ApiError(411, "length_required", "Content-Length required")
             elif int(length) > MAX_UPLOAD_BYTES:
-                status, message = 413, "upload too large"
+                err = ApiError(413, "too_long", f"upload larger than {MAX_UPLOAD_BYTES} bytes")
             elif model_error:
-                status, message = 503, model_error
+                err = ApiError(503, "internal", "models not loaded", {"Retry-After": "60"})
             elif jobs.locked():
-                status, message = 429, f"{MAX_JOBS} transcriptions already running, retry later"
-        if status:
-            return await JSONResponse({"error": {"message": message}}, status_code=status)(scope, receive, send)
+                err = busy()
+        if err:
+            return await err.response()(scope, receive, send)
         return await self.app(scope, receive, send)
 
 
 app.add_middleware(Gate)
 
 
-def decode(fd: int) -> np.ndarray:
-    """Any audio ffmpeg reads -> 16 kHz mono float32, at most MAX_SECONDS.
+def decode(fd: int, limit: float, path_name: str) -> np.ndarray:
+    """Any audio ffmpeg reads -> 16 kHz mono float32, at most `limit` seconds.
 
     fd is the upload Starlette already spooled to disk. ffprobe and ffmpeg open
     it as /dev/fd/N (a fresh, seekable open of the same file), so the upload is
-    never copied a second time.
+    never copied a second time. ffmpeg's own messages are not passed on: they
+    can quote the file's metadata.
     """
     path = f"/dev/fd/{fd}"
     probe = subprocess.run(
@@ -178,28 +308,30 @@ def decode(fd: int) -> np.ndarray:
     try:
         names = set(json.loads(probe.stdout)["format"]["format_name"].split(","))
     except (ValueError, KeyError):
-        raise HTTPException(status_code=400, detail="not an audio file ffmpeg can read")
+        raise ApiError(400, "audio_unreadable", "not an audio file ffmpeg can read")
     if not names & AUDIO_FORMATS:
-        raise HTTPException(status_code=400, detail=f"unsupported container {','.join(sorted(names))}")
+        raise ApiError(400, "audio_unreadable", f"unsupported container {','.join(sorted(names))}")
     # Decoded to a file, then read once: through a pipe the samples would sit in
     # memory twice (the bytes, then a writable copy for torch). 2 h = 460 MB.
     with tempfile.NamedTemporaryFile(suffix=".f32") as raw:
         proc = subprocess.run(
-            ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", path, "-t", str(MAX_SECONDS + 1),
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-y", "-i", path, "-t", str(limit + 1),
              "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "f32le", raw.name],
             capture_output=True, check=False, pass_fds=(fd,))
         if proc.returncode != 0:
-            raise HTTPException(status_code=400, detail="could not decode audio: "
-                                + proc.stderr.decode(errors="replace")[-300:])
+            raise ApiError(400, "audio_unreadable", "ffmpeg could not decode the audio")
         audio = np.fromfile(raw.name, dtype=np.float32)
     if not len(audio):
-        raise HTTPException(status_code=400, detail="no audio in the file")
-    if len(audio) / SAMPLE_RATE > MAX_SECONDS:
-        raise HTTPException(status_code=413, detail=f"audio longer than {MAX_SECONDS:.0f} s")
+        raise ApiError(400, "audio_unreadable", "the file holds no audio")
+    if len(audio) / SAMPLE_RATE > limit:
+        hint = "; use POST /v1/audio/transcriptions/jobs" if path_name == "direct" and limit < MAX_SECONDS else ""
+        raise ApiError(413, "too_long", f"audio longer than {limit:.0f} s for the {path_name} path{hint}")
     return audio
 
 
-def diarize(audio: np.ndarray, cancel: threading.Event, **speakers) -> list[tuple[float, float, str]]:
+def diarize(audio: np.ndarray, cancel: threading.Event, **speakers):
+    """-> (exclusive turns for words, overlap-aware turns for clean speech,
+    {label: pipeline centroid})."""
     import torch
 
     def hook(*args, **kwargs):  # pyannote calls this between and within steps
@@ -210,10 +342,15 @@ def diarize(audio: np.ndarray, cancel: threading.Event, **speakers) -> list[tupl
     out = models["pipeline"]({"waveform": wav, "sample_rate": SAMPLE_RATE}, hook=hook, **speakers)
     # community-1 also returns an overlap-free version: every instant has at
     # most one speaker, which is what assigning each word to one speaker needs.
-    ann = getattr(out, "exclusive_speaker_diarization", None)
-    if ann is None:
-        ann = getattr(out, "speaker_diarization", out)
-    return [(t.start, t.end, spk) for t, _, spk in ann.itertracks(yield_label=True)]
+    full = getattr(out, "speaker_diarization", out)
+    exclusive = getattr(out, "exclusive_speaker_diarization", None) or full
+    # speaker_embeddings rows follow full.labels(); zero rows (speakers the
+    # clustering never saw) are dropped by unit() later.
+    emb = getattr(out, "speaker_embeddings", None)
+    centroids = {} if emb is None else {lab: [float(x) for x in emb[i]] for i, lab in enumerate(full.labels())}
+    return ([(t.start, t.end, s) for t, _, s in exclusive.itertracks(yield_label=True)],
+            [(t.start, t.end, s) for t, _, s in full.itertracks(yield_label=True)],
+            centroids)
 
 
 def transcribe_words(audio: np.ndarray, cancel: threading.Event, language, prompt):
@@ -244,19 +381,65 @@ def transcribe_words(audio: np.ndarray, cancel: threading.Event, language, promp
     return words, detected
 
 
-def run_job(audio: np.ndarray, cancel: threading.Event, language, prompt, speakers) -> dict:
+def signatures(audio, full_turns, centroids, names, segments, cancel) -> list[dict]:
+    """One `speakers` entry per label used in `segments`, in label order.
+
+    speech_seconds is the speaker's clean speech (alone, no overlap): what a
+    pipeline-centroid vector is built from, and the cap (300 s) for clean-mean.
+    """
+    clean = clean_regions(full_turns)
+    label_of = {v: k for k, v in names.items()}
+    counts: dict = {}
+    for seg in segments:
+        counts[seg["speaker"]] = counts.get(seg["speaker"], 0) + 1
+    out = []
+    for label in sorted(counts, key=lambda s: int(s.rsplit(" ", 1)[-1])):
+        regions = clean.get(label_of[label], [])
+        entry = {"label": label, "speech_seconds": 0.0, "segment_count": counts[label], "embeddings": []}
+        available = sum(e - s for s, e in regions)
+        if available >= VOICE_MIN_SECONDS:
+            for vm in models["voices"]:
+                if cancel.is_set():
+                    raise Cancelled()
+                if vm.entry["method"] == "pipeline-centroid-v1":
+                    vec = unit(centroids.get(label_of[label]) or [])
+                else:
+                    vec, used = vm.signature(audio, regions, SAMPLE_RATE)
+                    if used < VOICE_MIN_SECONDS:
+                        vec = None
+                if vec is not None:
+                    entry["embeddings"].append({"model": vm.entry["model"], "version": vm.entry["version"],
+                                                "vector": [round(x, 6) for x in vec]})
+        entry["speech_seconds"] = round(available, 1)
+        out.append(entry)
+    return out
+
+
+def run_job(audio, cancel, language, prompt, speakers, want_voice, job_id="direct", on_start=None) -> dict:
     """The CPU part of a job. Returns everything the formatter needs."""
-    with cpu_lock:
-        t0 = time.monotonic()
-        turns = diarize(audio, cancel, **speakers)
-        t1 = time.monotonic()
-        words, detected = transcribe_words(audio, cancel, language, prompt)
-        t2 = time.monotonic()
     duration = len(audio) / SAMPLE_RATE
-    log.info("job done: audio %.0f s, diarize %.0f s, transcribe %.0f s, %d turns, %d words",
-             duration, t1 - t0, t2 - t1, len(turns), len(words))
-    return {"segments": assign_speakers(words, turns), "duration": duration,
-            "language": language or detected}
+    with cpu_lock:
+        current.update(audio_seconds=duration)
+        if on_start:
+            on_start()
+        try:
+            t0 = time.monotonic()
+            turns, full_turns, centroids = diarize(audio, cancel, **speakers)
+            t1 = time.monotonic()
+            words, detected = transcribe_words(audio, cancel, language, prompt)
+            t2 = time.monotonic()
+            names: dict = {}
+            segments = assign_speakers(words, turns, names)
+            if not segments:
+                raise ApiError(422, "no_speech", "no speech was found in the audio")
+            voice = signatures(audio, full_turns, centroids, names, segments, cancel) if want_voice else None
+            t3 = time.monotonic()
+        finally:
+            current.clear()
+    log.info("job %s done: audio %.0f s, diarize %.0f s, transcribe %.0f s, signatures %.0f s, "
+             "%d turns, %d words, %d speakers", job_id, duration, t1 - t0, t2 - t1, t3 - t2,
+             len(turns), len(words), len({s["speaker"] for s in segments}))
+    return {"segments": segments, "duration": duration, "language": language or detected, "speakers": voice}
 
 
 def render(result: dict, response_format: str):
@@ -266,36 +449,49 @@ def render(result: dict, response_format: str):
     if response_format == "text":
         return labelled
     if response_format == "verbose_json":
-        return {"task": "transcribe", "language": result["language"], "duration": round(duration, 2),
+        body = {"task": "transcribe", "language": result["language"], "duration": round(duration, 2),
                 "text": labelled, "segments": segments, "usage": usage}
-    if response_format == "diarized_json":
-        return {"task": "transcribe", "duration": round(duration, 2), "text": labelled,
+    elif response_format == "diarized_json":
+        body = {"task": "transcribe", "language": result["language"], "duration": round(duration, 2),
+                "text": labelled,
                 "segments": [{"type": "transcript.text.segment", **seg, "id": f"seg_{seg['id']}"}
                              for seg in segments],
                 "usage": usage}
-    return {"text": labelled, "usage": usage}
+    else:
+        body = {"text": labelled, "language": result["language"], "duration": round(duration, 2), "usage": usage}
+    if result.get("speakers") is not None:
+        body["speakers"] = result["speakers"]
+    return body
 
 
-def check_request(response_format):
+def check_request(response_format, want_voice):
     """Re-checked here because Gate's checks and the job slot are not atomic."""
     if response_format not in FORMATS:
-        raise HTTPException(status_code=400, detail=f"unsupported response_format {response_format!r}")
+        raise ApiError(400, "invalid_request", f"unsupported response_format {response_format!r}")
+    if want_voice and response_format == "text":
+        raise ApiError(400, "invalid_request", "include_speaker_embeddings needs a JSON response_format")
+    if want_voice and voice_error:
+        raise ApiError(503, "internal", "voice models unavailable; see /v1/status", {"Retry-After": "300"})
     if model_error:
-        raise HTTPException(status_code=503, detail=model_error)
+        raise ApiError(503, "internal", "models not loaded", {"Retry-After": "60"})
     if jobs.locked():
-        raise HTTPException(status_code=429, detail=f"{MAX_JOBS} transcriptions already running, retry later")
+        raise busy()
 
 
-async def receive(file: UploadFile) -> np.ndarray:
+async def receive(file: UploadFile, limit: float, path_name: str) -> np.ndarray:
     """Decode the spooled upload, then delete the spool (it would sit on disk for the whole job)."""
     try:
         spool = file.file
         if hasattr(spool, "rollover"):
             spool.rollover()  # a small upload may still be in memory; give it a file
         spool.flush()
-        if os.fstat(spool.fileno()).st_size > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="upload too large")
-        return await asyncio.to_thread(decode, spool.fileno())
+        size = os.fstat(spool.fileno()).st_size
+        if size > MAX_UPLOAD_BYTES:
+            raise ApiError(413, "too_long", f"upload larger than {MAX_UPLOAD_BYTES} bytes")
+        claim(size)
+        audio = await asyncio.to_thread(decode, spool.fileno(), limit, path_name)
+        current.update(audio_seconds=len(audio) / SAMPLE_RATE)
+        return audio
     finally:
         await file.close()
 
@@ -308,40 +504,66 @@ def speaker_args(num_speakers, min_speakers, max_speakers):
 @app.get("/health")
 async def health():
     if model_error:
-        return JSONResponse({"status": "unavailable", "detail": model_error}, status_code=503)
-    return {"status": "ok", "threads": THREADS, "busy": jobs.locked()}
+        return JSONResponse({"status": "unavailable"}, status_code=503)
+    return {"status": "ok", "busy": jobs.locked()}
+
+
+@app.get("/v1/status")
+async def status():
+    return {
+        "ready": not model_error,
+        "detail": model_error or None,
+        "voice_error": voice_error or None,
+        "busy": jobs.locked(),
+        "retry_after": retry_after() if jobs.locked() else None,
+        "models": model_info or None,
+        "limits": {
+            "max_upload_bytes": MAX_UPLOAD_BYTES,
+            "direct": {"max_audio_seconds": DIRECT_MAX_SECONDS},
+            "jobs": {"max_audio_seconds": MAX_SECONDS, "result_retention_seconds": JOB_TTL},
+            "concurrent_jobs": MAX_JOBS,
+            "voice_min_clean_speech_seconds": VOICE_MIN_SECONDS,
+        },
+    }
 
 
 @app.post("/v1/audio/transcriptions")
 async def transcriptions(
     request: Request,
     file: UploadFile = File(...),
-    model: str = Form("transcribe"),
+    model: str | None = Form(None),               # accepted, ignored: one model is served
+    chunking_strategy: str | None = Form(None),   # accepted, ignored: chunking is internal
     response_format: str = Form("json"),
     language: str | None = Form(None),
     prompt: str | None = Form(None),
     num_speakers: int | None = Form(None),
     min_speakers: int | None = Form(None),
     max_speakers: int | None = Form(None),
+    include_speaker_embeddings: bool = Form(False),
 ):
-    check_request(response_format)
+    check_request(response_format, include_speaker_embeddings)
     async with jobs:
-        audio = await receive(file)
+        try:
+            audio = await receive(file, DIRECT_MAX_SECONDS, "direct")
+        except BaseException:
+            current.clear()
+            raise
         cancel = threading.Event()
 
         async def watch():
             while not cancel.is_set():
                 if await request.is_disconnected():
-                    log.info("client went away; cancelling")
+                    log.info("direct request: client went away; cancelling")
                     cancel.set()
                 await asyncio.sleep(2)
 
         watcher = asyncio.create_task(watch())
         try:
             result = await asyncio.to_thread(run_job, audio, cancel, language, prompt,
-                                             speaker_args(num_speakers, min_speakers, max_speakers))
+                                             speaker_args(num_speakers, min_speakers, max_speakers),
+                                             include_speaker_embeddings)
         except Cancelled:
-            raise HTTPException(status_code=499, detail="client went away")
+            raise ApiError(499, "cancelled", "client went away")
         finally:
             cancel.set()
             watcher.cancel()
@@ -351,61 +573,89 @@ async def transcriptions(
 
 @app.post("/v1/audio/transcriptions/jobs", status_code=202)
 async def submit_job(
+    request: Request,
     file: UploadFile = File(...),
-    model: str = Form("transcribe"),
+    model: str | None = Form(None),
+    chunking_strategy: str | None = Form(None),
     response_format: str = Form("json"),
     language: str | None = Form(None),
     prompt: str | None = Form(None),
     num_speakers: int | None = Form(None),
     min_speakers: int | None = Form(None),
     max_speakers: int | None = Form(None),
+    include_speaker_embeddings: bool = Form(False),
+    idempotency_key: str | None = Form(None),
 ):
-    check_request(response_format)
+    key = request.headers.get("idempotency-key") or idempotency_key or None
+    if key is not None and not IDEMPOTENCY_KEY.match(key):
+        raise ApiError(400, "invalid_request", "idempotency key: 1-128 of A-Z a-z 0-9 . _ : -")
+    if key and idempotency.get(key) in async_jobs:
+        await file.close()
+        return JSONResponse(job_view(async_jobs[idempotency[key]]), status_code=200)
+    check_request(response_format, include_speaker_embeddings)
     await jobs.acquire()
+    # The job exists, and owns its key, from the moment it holds the slot, so a
+    # repeat arriving while this upload decodes finds it instead of a second run.
+    job_id = uuid.uuid4().hex
+    job = async_jobs[job_id] = {"id": job_id, "status": "queued", "created": time.time()}
+    if key:
+        idempotency[key] = job_id
     try:
-        audio = await receive(file)
+        audio = await receive(file, MAX_SECONDS, "job")
     except BaseException:
+        async_jobs.pop(job_id, None)
+        if key and idempotency.get(key) == job_id:
+            idempotency.pop(key, None)
+        current.clear()
         jobs.release()
         raise
-    job_id = uuid.uuid4().hex
-    job = async_jobs[job_id] = {"id": job_id, "status": "running", "created": time.time(),
-                                "response_format": response_format}
+    log.info("job %s queued: audio %.0f s", job_id, len(audio) / SAMPLE_RATE)
+
+    def started():
+        job.update(status="running", started=time.time())
 
     async def work():
         try:
             result = await asyncio.to_thread(run_job, audio, threading.Event(), language, prompt,
-                                             speaker_args(num_speakers, min_speakers, max_speakers))
-            job.update(status="completed", result=render(result, response_format))
+                                             speaker_args(num_speakers, min_speakers, max_speakers),
+                                             include_speaker_embeddings, job_id, started)
+            job.update(status="done", result=render(result, response_format))
+        except ApiError as e:
+            log.info("job %s failed: %s", job_id, e.reason)
+            job.update(status="failed", error=e.body()["error"])
         except Exception as e:
-            log.exception("job %s failed", job_id)
-            job.update(status="failed", error=getattr(e, "detail", None) or repr(e)[:300])
+            log.error("job %s failed: internal %s", job_id, type(e).__name__)
+            job.update(status="failed", error={"reason": "internal", "message": "internal error"})
         finally:
+            # `internal` is retryable: free the key so a resubmit with it runs
+            # again (the failed job stays readable by id until purged).
+            if job.get("error", {}).get("reason") == "internal" and key and idempotency.get(key) == job_id:
+                idempotency.pop(key, None)
             job["finished"] = time.time()
             jobs.release()
 
     job["_task"] = asyncio.create_task(work())  # keep a reference: the loop holds tasks weakly
-    return {"id": job_id, "status": "running"}
+    return JSONResponse(job_view(job), status_code=202)
 
 
 @app.get("/v1/audio/transcriptions/jobs/{job_id}")
 async def get_job(job_id: str):
     job = async_jobs.get(job_id)
     if job is None:
-        raise HTTPException(status_code=404, detail="no such job (finished jobs expire, and a restart forgets all)")
-    out = {k: job[k] for k in ("id", "status", "created") if k in job}
-    if job["status"] == "failed":
-        out["error"] = job["error"]
-    if job["status"] == "completed":
-        if job["response_format"] == "text":
-            out["text"] = job["result"]
-        else:
-            out["result"] = job["result"]
-    return out
+        raise ApiError(404, "not_found", "no such job: finished jobs are purged after "
+                       f"{JOB_TTL:.0f} s and a restart forgets all; resubmit with the same idempotency key")
+    return job_view(job)
+
+
+def purge(now: float):
+    for job_id in [k for k, j in async_jobs.items() if j.get("finished") and now - j["finished"] > JOB_TTL]:
+        async_jobs.pop(job_id, None)
+        for key in [k for k, v in idempotency.items() if v == job_id]:
+            idempotency.pop(key, None)
+        log.info("job %s purged", job_id)
 
 
 async def reap_jobs():
     while True:
-        now = time.time()
-        for job_id in [k for k, j in async_jobs.items() if now - j.get("finished", now) > JOB_TTL]:
-            async_jobs.pop(job_id, None)
-        await asyncio.sleep(300)
+        purge(time.time())
+        await asyncio.sleep(60)
