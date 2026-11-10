@@ -49,9 +49,11 @@ a usable vector: Thomas with 23 s of clean speech scored 0.913 to 0.933 against
 his own long references, and with 7 s, 0.900 to 0.907; different people stayed
 under 0.26 for both. That is two speakers, not a curve.
 
-Method B gives the curve (N seconds of clean speech against other recordings'
-full signatures): at 5 s the same-person minimum is 0.35 and 18% fall under
-0.5; at 10 s, 0.35 / 2.8%; from 20 s, no false rejects at 0.5.
+Method B gives a curve, binned by the clean speech each short signature actually used
+(the 5 s budget could take up to about 8 s before a fix found in review), compared against
+other recordings' full B signatures: at 2-6 s the same-person minimum is 0.02 and 30%
+fall under 0.5; at 6-12 s, 0.35 and 3.5%; from 12 s on, no false rejects at 0.5. B's
+false accepts stay high at every length, which is why it is not the default.
 
 ## Forced speaker count
 

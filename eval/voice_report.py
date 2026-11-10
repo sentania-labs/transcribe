@@ -82,20 +82,23 @@ def main():
                      for a, b in itertools.combinations(full, 2)
                      if a["rec"] != b["rec"] and a["person"] == b["person"])[:5]
         print("  lowest same-person pairs:", [(round(c, 3), short(p), r, s) for c, p, r, s in low])
-    print("\nShort signatures: N seconds of clean speech vs the other recordings' full signatures (B)")
-    print("  N    same: min   p5    mean | different: p95   max  | false-accept at 0.5 / false-reject at 0.5")
-    for n in ("5", "10", "20", "30", "60", "120"):
+    print("\nShort signatures (B): clean speech ACTUALLY used, binned, vs the other recordings' full signatures")
+    print("  seconds  same: min   p5    mean | different: p95   max  | false-accept at 0.5 / false-reject at 0.5")
+    bins = ((2, 6), (6, 12), (12, 20), (20, 35), (35, 70), (70, 1e9))
+    for lo, hi in bins:
         same, diff = [], []
         for a in spk:
-            sv = a["B_budget"][n]["vector"]
-            if not sv or a["B_budget"][n]["seconds"] < float(n) * 0.6:
+            picks = [v for v in a["B_budget"].values() if v["vector"] and lo <= v["seconds"] < hi]
+            if not picks:
                 continue
+            sv = picks[0]["vector"]
             for b in full:
                 if b["rec"] == a["rec"] or not b["B_full"]:
                     continue
                 (same if b["person"] == a["person"] else diff).append(cos(sv, b["B_full"]))
         if same and diff:
-            print(f"  {n:>3}  {min(same):.3f} {pct(same, .05):.3f} {sum(same) / len(same):.3f} | "
+            n = f"{lo}-{hi if hi < 1e9 else 'inf'}"
+            print(f"  {n:>7}  {min(same):.3f} {pct(same, .05):.3f} {sum(same) / len(same):.3f} | "
                   f"{pct(diff, .95):.3f} {max(diff):.3f} | {sum(c >= .5 for c in diff) / len(diff):.1%} / "
                   f"{sum(c < .5 for c in same) / len(same):.1%}")
 

@@ -152,6 +152,12 @@ def embedding_windows(regions, budget: float = SPEAKER_BUDGET):
     keep = [pieces[i] for i in idx]
     while len(keep) > 1 and sum(b - a for a, b in keep) > budget:
         keep.pop(len(keep) // 2)
+    if sum(b - a for a, b in keep) > budget:  # one window left, still too long: trim it
+        if budget < WINDOW_MIN:
+            return []
+        a, b = keep[0]
+        mid = (a + b) / 2
+        keep = [(mid - budget / 2, mid + budget / 2)]
     return keep
 
 

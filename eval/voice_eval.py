@@ -28,7 +28,7 @@ RATE = 16000
 PIPE = os.environ.get("DIARIZATION_PIPELINE", "/work/models/pyannote/speaker-diarization-community-1")
 STEP = float(os.environ.get("DIARIZATION_STEP", 0.25))
 BUDGETS = (5, 10, 20, 30, 60, 120)
-ENTRY = {"model": "eval", "revision": "eval", "method": "clean-mean-v1",
+ENTRY = {"model": "eval", "revision": "eval", "method": "clean-mean-v1", "version": "eval",
          "path": os.path.join(PIPE, "embedding"),
          "sha256": "6f10ff60898a1d185fa22e1d11e0bfa8a92efec811f11bca48cb8cafebefd929"}
 

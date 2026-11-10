@@ -31,6 +31,13 @@ def test_embedding_windows_split_drop_and_budget():
     assert picked[0][0] == 0.0 and picked[-1][0] == 1980.0  # first and last piece: spread over the whole span
 
 
+def test_embedding_windows_never_exceed_budget():
+    for budget in (1.0, 5.0, 9.0):
+        wins = embedding_windows([(0.0, 100.0)], budget=budget)
+        assert sum(b - a for a, b in wins) <= budget + 1e-9
+    assert embedding_windows([(0.0, 100.0)], budget=1.0) == []
+
+
 def test_mean_signature_is_unit_and_skips_bad():
     v = mean_signature([[3.0, 4.0], [0.0, 0.0], [1.0, 0.0]], [1.0, 5.0, 1.0])
     assert abs(math.hypot(*v) - 1.0) < 1e-9
